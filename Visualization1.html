@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Dashboard — Radial Bar + Heatmap + Grouped Bars (Option A)</title>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <style>
+    body {
+      font-family: "Segoe UI", Roboto, Arial, sans-serif;
+      background: #f6f7fb;
+      color: #222;
+      margin: 18px;
+    }
+    h1 { text-align:center; margin-bottom:8px; }
+    #controls { text-align:center; margin-bottom: 12px; }
+    #dashboard {
+      display: grid;
+      grid-template-columns: 520px 720px;
+      gap: 18px;
+      justify-content: center;
+      align-items: start;
+    }
+    #left-col { display:flex; flex-direction:column; gap:18px; align-items:center; }
+    .card {
+      background: #fff;
+      border-radius: 8px;
+      padding: 12px;
+      box-shadow: 0 6px 18px rgba(0,0,0,0.06);
+    }
+    .chart-title { font-weight:600; margin-bottom:8px; text-align:center; }
+    svg { display:block; }
+    .tooltip {
+      position: absolute;
+      background: #fff;
+      border: 1px solid #333;
+      padding: 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      pointer-events: none;
+      box-shadow: 0 3px 10px rgba(0,0,0,0.15);
+      opacity: 0;
+    }
+    select { padding:6px 10px; border-radius:6px; border:1px solid #ccc; }
+    .legend { display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:center; margin-top:8px; }
+    .legend-item { display:flex; gap:6px; align-items:center; font-size:12px; }
+    .legend-swatch { width:14px; height:12px; border-radius:2px; }
+    .axis text { font-size:11px; }
+    /* small responsive tweak */
+    @media (max-width:1200px) {
+      #dashboard { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Accident Sub-Type Dashboard — Radial + Heatmap + Grouped Bars</h1>
+
+  <div id="controls">
+    <label for="typeSelect">Filter by accident sub-type: </label>
+    <select id="typeSelect"></select>
+    <span style="margin-left:16px; color:#555; font-size:13px;">(Selecting "All Types" shows aggregated view)</span>
+  </div>
+
+  <div id="dashboard">
+    <div id="left-col">
+      <div class="card" id="radial-card">
+        <div class="chart-title">Radial Bar Chart — Hourly Distribution</div>
+        <div id="radial"></div>
+      </div>
+
+      <div class="card" id="grouped-card">
+        <div class="chart-title">Grouped Bar Chart — 4-hour Buckets by Weekday</div>
+        <div id="grouped"></div>
+      </div>
+    </div>
+
+    <div class="card" id="heatmap-card">
+      <div class="chart-title">Heatmap — Hour (rows) × Date (columns)</div>
+      <div id="heatmap"></div>
+      <div class="legend" id="heatmap-legend"></div>
+    </div>
+  </div>
+
+  <div class="tooltip" id="tooltip"></div>
+
+<script>
+/* =========================
+   CONFIG & DATA URL
+   ========================= */
+const dataUrl = 'https://raw.githubusercontent.com/sheriefAbdallah/CS318/refs/heads/main/Traffic_Incidents.csv';
+const tooltip = d3.select("#tooltip");
+
+/* =========================
+   STATE & PARSERS
+   ========================= */
+let raw = [];
+let allTypes = [];
+const parseDTime1 = d3.timeParse("%d/%m/%Y %H:%M:%S"); // dd/mm/yyyy HH:MM:SS
+const parseISO = d3.timeParse("%Y-%m-%d %H:%M:%S");    // fallback ISO-like
+const parseYMD = d3.timeParse("%Y-%m-%d");            // for formatting
+
+/* =========================
+   LAYOUT SIZES
+   ========================= */
+/* Radial */
+const radialW = 520, radialH = 520, radialR = 200, innerR = 22;
+/* Heatmap */
+const heatW = 700, heatH = 520, heatMargin = {top:30,right:10,bottom:80,left:70};
+/* Grouped */
+const grpW = 520, grpH = 300, grpMargin = {top:30,right:20,bottom:70,left:55};
+
+/* =========================
+   HELPERS
+   ========================= */
+function safeText(s) { return s ? s : "(unknown)"; }
+function weekdayName(n) { return ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][n]; }
+const bucketLabels = ["00-03","04-07","08-11","12-15","16-19","20-23"];
+function hourToBucket(h) { return Math.floor(h/4); } // 0..5
+
+/* =========================
+   LOAD DATA
+   ========================= */
+d3.csv(dataUrl).then(data => {
+
+  raw = data.map(d => {
+    // Try multiple parse strategies to extract a Date object
+    let dt = null;
+    if (d.acci_time) {
+      // If file has a date/time combined in one field use that
+      dt = parseDTime1(d.acci_time);
+      if (!dt) dt = parseISO(d.acci_time);
+      if (!dt) {
+        // Try if date and time are split or different format: fallback to Date constructor
+        const tryDate = new Date(d.acci_time);
+        if (!isNaN(tryDate)) dt = tryDate;
+      }
+    }
+
+    // Some CSVs store only time or different formats; attempt to extract hour safely
+    let hour = null;
+    if (dt) hour = dt.getHours();
+    else if (d.acci_time && d.acci_time.includes(":")) {
+      const cand = +d.acci_time.split(":")[0];
+      hour = (!isNaN(cand) && cand>=0 && cand<=23) ? cand : null;
+    } else {
+      hour = null;
+    }
+
+    const dateStr = dt ? d3.timeFormat("%Y-%m-%d")(dt) : null;
+    const weekday = dt ? dt.getDay() : null;
+
+    return {
+      hour: hour,
+      date: dateStr,
+      weekday: weekday,
+      rawDateObj: dt,
+      name: safeText(d.acci_name),
+      x: d.acci_x,
+      y: d.acci_y
+    };
+  }).filter(d => d.hour !== null);
+
+  // build type list
+  allTypes = Array.from(new Set(raw.map(d => d.name))).sort();
+  allTypes.unshift("All Types");
+
+  // populate dropdown
+  const sel = d3.select("#typeSelect");
+  sel.selectAll("option").data(allTypes).enter()
+    .append("option").attr("value", d=>d).text(d=>d);
+
+  // init visualizations & initial render
+  initRadial();
+  initHeatmap();
+  initGrouped();
+  updateAll("All Types");
+
+  // wire dropdown
+  sel.on("change", function(){ updateAll(this.value); });
+
+}).catch(err=>{
+  d3.select("body").append("pre").text("Error loading CSV: "+err);
+});
+
+
+/* =========================
+   RADIAL CHART
+   ========================= */
+let radialSvg, xBand, yRadial, arcGen;
+function initRadial() {
+  radialSvg = d3.select("#radial").append("svg")
+    .attr("width", radialW).attr("height", radialH)
+    .append("g").attr("transform", `translate(${radialW/2},${radialH/2})`);
+
+  xBand = d3.scaleBand().domain(d3.range(24)).range([0,2*Math.PI]).align(0);
+  yRadial = d3.scaleRadial().range([innerR, radialR]);
+
+  arcGen = d3.arc()
+    .innerRadius(innerR)
+    .outerRadius(d => yRadial(d.count))
+    .startAngle(d => xBand(d.hour))
+    .endAngle(d => xBand(d.hour) + xBand.bandwidth())
+    .padAngle(0.01).padRadius(innerR);
+
+  // hour spokes
+  radialSvg.selectAll(".spoke").data(d3.range(24)).enter()
+    .append("line")
+    .attr("class","spoke")
+    .attr("x1", innerR).attr("x2", radialR)
+    .attr("stroke", "#eee")
+    .attr("transform", d => `rotate(${(xBand(d)*180/Math.PI)-90})`);
+
+  // hour labels every 3 hours
+  radialSvg.selectAll(".hour-label").data(d3.range(0,24,3)).enter()
+    .append("text")
+    .attr("class","hour-label")
+    .attr("transform", d => {
+      const angle = xBand(d) + xBand.bandwidth()/2;
+      const xPos = (radialR+20) * Math.cos(angle - Math.PI/2);
+      const yPos = (radialR+20) * Math.sin(angle - Math.PI/2);
+      const rot = (angle > Math.PI/2 && angle < 3*Math.PI/2) ? ((angle*180/Math.PI)-90)+180 : (angle*180/Math.PI)-90;
+      return `translate(${xPos},${yPos}) rotate(${rot})`;
+    })
+    .attr("text-anchor","middle")
+    .style("font-size","12px")
+    .text(d => `${d}:00`);
+}
+
+function updateRadial(data) {
+  const maxC = d3.max(data, d => d.count) || 1;
+  yRadial.domain([0, maxC * 1.15]);
+
+  const ticks = yRadial.ticks ? yRadial.ticks(4) : [0, Math.ceil(maxC/3), Math.ceil(maxC*2/3), maxC];
+
+  // grid circles
+  const circles = radialSvg.selectAll(".grid-circle").data(ticks);
+  circles.join(
+    enter => enter.append("circle").attr("class","grid-circle").attr("r", d => yRadial(d)).attr("fill","none").attr("stroke","#ddd").attr("stroke-dasharray","3 3"),
+    update => update.transition().duration(350).attr("r", d => yRadial(d)),
+    exit => exit.remove()
+  );
+
+  // labels
+  const labs = radialSvg.selectAll(".grid-label").data(ticks.filter(d=>d>0));
+  labs.join(
+    enter => enter.append("text").attr("class","grid-label").attr("y", d => -yRadial(d)).attr("dx","6px").attr("dy","0.35em").style("font-size","11px").text(d => d),
+    update => update.transition().duration(350).attr("y", d => -yRadial(d)).text(d=>d),
+    exit => exit.remove()
+  );
+
+  // bars
+  const bars = radialSvg.selectAll(".radial-bar").data(data, d=>d.hour);
+  bars.join(
+    enter => enter.append("path").attr("class","radial-bar")
+      .attr("fill", d => d3.interpolateSpectral(d.hour/23))
+      .attr("d", arcGen)
+      .on("mousemove", (event,d) => {
+        tooltip.style("opacity",1).style("left",(event.pageX+12)+"px").style("top",(event.pageY-18)+"px")
+               .html(`<strong>${d.hour}:00</strong><br/>Incidents: ${d.count}`);
+      })
+      .on("mouseout", ()=> tooltip.style("opacity",0)),
+    update => update.transition().duration(450).attr("d", arcGen).attr("fill", d=>d3.interpolateSpectral(d.hour/23)),
+    exit => exit.remove()
+  );
+}
+
+/* =========================
+   HEATMAP
+   ========================= */
+let heatSvg, heatColor;
+function initHeatmap(){
+  heatSvg = d3.select("#heatmap").append("svg")
+    .attr("width", heatW).attr("height", heatH);
+
+  heatSvg.append("g").attr("class","heat-plot");
+  heatSvg.append("g").attr("class","heat-x axis").attr("transform", `translate(0,${heatH - heatMargin.bottom})`);
+  heatSvg.append("g").attr("class","heat-y axis").attr("transform", `translate(${heatMargin.left},0)`);
+}
+
+function updateHeatmap(filtered) {
+  // determine dateList (sorted) across filtered data
+  const dateSet = Array.from(new Set(filtered.map(d => d.date))).filter(d=>d!=null);
+  // If there are no dates (rare), fallback to a single column / aggregated view
+  const dateList = dateSet.sort((a,b)=> d3.ascending(a,b));
+
+  // build map of date->hour->count
+  const nested = d3.rollups(filtered, v => v.length, d => d.date, d => d.hour);
+  const mapDate = new Map(nested.map(([date, arr]) => [date, new Map(arr)]));
+
+  // cells array
+  const cells = [];
+  dateList.forEach((date, cidx) => {
+    for(let h=0; h<24; h++){
+      const cnt = (mapDate.get(date) && mapDate.get(date).get(h)) || 0;
+      cells.push({date, hour:h, count:cnt, cidx});
+    }
+  });
+
+  // scales and cell sizes
+  const innerWidth = heatW - heatMargin.left - heatMargin.right;
+  const innerHeight = heatH - heatMargin.top - heatMargin.bottom;
+  const cellW = Math.max(10, innerWidth / Math.max(1,dateList.length));
+  const cellH = Math.max(12, innerHeight / 24);
+
+  const x = d3.scaleBand().domain(dateList).range([heatMargin.left, heatW - heatMargin.right]);
+  const y = d3.scaleBand().domain(d3.range(24)).range([heatMargin.top, heatH - heatMargin.bottom]);
+
+  const maxCnt = d3.max(cells, d=>d.count) || 1;
+  heatColor = d3.scaleSequential(d3.interpolateYlOrRd).domain([0, maxCnt]);
+
+  const plot = heatSvg.select(".heat-plot");
+  const sel = plot.selectAll(".cell").data(cells, d=>d.date+":"+d.hour);
+  sel.join(
+    enter => enter.append("rect").attr("class","cell")
+      .attr("x", d => x(d.date)).attr("y", d => y(d.hour))
+      .attr("width", cellW).attr("height", cellH)
+      .attr("stroke","#fff").attr("stroke-width",0.5)
+      .attr("fill", d => heatColor(d.count))
+      .on("mousemove",(event,d) => {
+         tooltip.style("opacity",1).style("left",(event.pageX+12)+"px").style("top",(event.pageY-18)+"px")
+                .html(`<strong>${d.date}</strong><br/>Hour: ${d.hour}:00<br/>Count: ${d.count}`);
+      })
+      .on("mouseout", ()=> tooltip.style("opacity",0)),
+    update => update.transition().duration(350).attr("x", d => x(d.date)).attr("y", d => y(d.hour)).attr("width", cellW).attr("height", cellH).attr("fill", d => heatColor(d.count)),
+    exit => exit.remove()
+  );
+
+  // x axis (show up to ~12 ticks to avoid overlap)
+  const maxLabels = 12;
+  const tickValues = dateList.filter((d,i) => {
+    if(dateList.length <= maxLabels) return true;
+    const step = Math.ceil(dateList.length / maxLabels);
+    return (i % step === 0);
+  });
+
+  const parseYMD = d3.timeParse("%Y-%m-%d");
+  const xAxis = d3.axisBottom(x).tickValues(tickValues).tickFormat(d => {
+    const dt = parseYMD(d);
+    return dt ? d3.timeFormat("%b %d")(dt) : d;
+  });
+
+  heatSvg.select(".heat-x.axis").call(xAxis).selectAll("text").attr("transform","rotate(-60)").style("text-anchor","end");
+  heatSvg.select(".heat-y.axis").call(d3.axisLeft(y).tickFormat(d => d + ":00"));
+
+  // legend
+  const legendDiv = d3.select("#heatmap-legend");
+  legendDiv.html("");
+  const steps = 6;
+  const legendValues = d3.range(steps+1).map(i => Math.round(i*(maxCnt/steps)));
+  legendValues.forEach(v=>{
+    legendDiv.append("div").style("display","flex").style("align-items","center").style("gap","6px")
+      .html(`<div class="legend-swatch" style="background:${heatColor(v)}"></div><div style="font-size:12px">${v}</div>`);
+  });
+
+  // if no dates show message
+  if(dateList.length === 0) {
+    plot.selectAll(".no-data").data([0]).join(
+      enter => enter.append("text").attr("class","no-data").attr("x", heatW/2).attr("y", heatH/2).attr("text-anchor","middle").text("No date info available for this filter"),
+      update => update
+    );
+  } else {
+    plot.selectAll(".no-data").remove();
+  }
+}
+
+/* =========================
+   GROUPED BAR CHART
+   ========================= */
+let grpSvg;
+function initGrouped(){
+  grpSvg = d3.select("#grouped").append("svg")
+    .attr("width", grpW).attr("height", grpH);
+
+  grpSvg.append("g").attr("class","x-axis").attr("transform", `translate(0,${grpH - grpMargin.bottom})`);
+  grpSvg.append("g").attr("class","y-axis").attr("transform", `translate(${grpMargin.left},0)`);
+
+  grpSvg.append("text")
+    .attr("x", grpW/2).attr("y", 18).attr("text-anchor","middle")
+    .style("font-weight",600).style("font-size","13px")
+    .text("Counts by 4-hour bucket and weekday");
+}
+
+function updateGrouped(filtered) {
+  // nested bucket->weekday->count
+  const nested = d3.rollups(filtered, v => v.length, d => hourToBucket(d.hour), d => d.weekday);
+  const mapB = new Map(nested.map(([b, arr]) => [b, new Map(arr)]));
+
+  const data = [];
+  for(let b=0;b<6;b++){
+    for(let w=0; w<7; w++){
+      data.push({bucket:b, weekday:w, count: (mapB.get(b) && mapB.get(b).get(w)) ? mapB.get(b).get(w) : 0});
+    }
+  }
+
+  const x0 = d3.scaleBand().domain(d3.range(6)).range([grpMargin.left, grpW - grpMargin.right]).paddingInner(0.12);
+  const x1 = d3.scaleBand().domain(d3.range(7)).range([0, x0.bandwidth()]).padding(0.06);
+  const maxC = d3.max(data, d=>d.count) || 1;
+  const y = d3.scaleLinear().domain([0, maxC*1.2]).range([grpH - grpMargin.bottom, grpMargin.top]);
+
+  const color = d3.scaleOrdinal().domain(d3.range(7)).range(d3.schemeTableau10);
+
+  // groups
+  const groups = grpSvg.selectAll(".bucket-group").data(d3.range(6));
+  groups.join(
+    enter => {
+      const g = enter.append("g").attr("class","bucket-group")
+        .attr("transform", d => `translate(${x0(d)},0)`);
+      g.selectAll("rect").data(d => data.filter(x => x.bucket===d)).enter().append("rect")
+        .attr("class","grp-rect")
+        .attr("x", d=>x1(d.weekday))
+        .attr("y", d => y(d.count))
+        .attr("width", x1.bandwidth())
+        .attr("height", d => y(0)-y(d.count))
+        .attr("fill", d => color(d.weekday))
+        .on("mousemove",(event,d)=>{
+          tooltip.style("opacity",1).style("left",(event.pageX+12)+"px").style("top",(event.pageY-18)+"px")
+                 .html(`${bucketLabels[d.bucket]}<br/>${weekdayName(d.weekday)}: ${d.count}`);
+        })
+        .on("mouseout", ()=> tooltip.style("opacity",0));
+    },
+    update => {
+      update.attr("transform", d => `translate(${x0(d)},0)`);
+      update.selectAll(".grp-rect").data(d => data.filter(x => x.bucket===d))
+        .join("rect")
+        .attr("x", d=>x1(d.weekday))
+        .transition().duration(350)
+        .attr("y", d => y(d.count)).attr("width", x1.bandwidth()).attr("height", d => y(0)-y(d.count)).attr("fill", d=>color(d.weekday));
+    },
+    exit => exit.remove()
+  );
+
+  // axes
+  grpSvg.select(".x-axis").call(d3.axisBottom(x0).tickFormat((d)=>bucketLabels[d]));
+  grpSvg.select(".y-axis").transition().duration(300).call(d3.axisLeft(y).ticks(5));
+
+  // weekday legend (render once)
+  const legendContainer = d3.select("#grouped").select(".weekday-legend");
+  if (legendContainer.empty()) {
+    const legend = d3.select("#grouped").append("div").style("display","flex").style("gap","8px").style("justify-content","center").style("margin-top","8px").attr("class","weekday-legend");
+    for(let w=0; w<7; w++){
+      legend.append("div").attr("class","legend-item").html(`<div style="width:12px;height:12px;background:${d3.schemeTableau10[w]};margin-right:6px;border-radius:2px;"></div>${weekdayName(w)}`);
+    }
+  }
+}
+
+/* =========================
+   ORCHESTRATOR: updateAll
+   ========================= */
+function updateAll(selection) {
+  const filtered = (selection === "All Types") ? raw : raw.filter(d => d.name === selection);
+
+  // radial data
+  const hourly = d3.rollup(filtered, v => v.length, d => d.hour);
+  const radialData = d3.range(24).map(h => ({hour:h, count: hourly.get(h) || 0}));
+  updateRadial(radialData);
+
+  // heatmap
+  updateHeatmap(filtered);
+
+  // grouped
+  updateGrouped(filtered);
+}
+
+</script>
+</body>
+</html>
